@@ -8,25 +8,15 @@ import hashlib
 import hmac
 import locale
 import os
+import platform
 import sys
 import time
 import urllib
 import urllib2
-import urlparse
 
 import gflags as flags
 import google.apputils.app as app
 import google.apputils.appcommands as appcommands
-
-FLAGS = flags.FLAGS
-
-flags.DEFINE_string('amazon_id_file',
-                    '/Users/craigcitro/.amazon-id',
-                    'File containing amazon identity')
-flags.DEFINE_string('amazon_key_file',
-                    '/Users/craigcitro/.amazon-key',
-                    'File containing amazon secret key')
-
 
 # URL encoding process is described here:
 #   http://docs.amazonwebservices.com/AWSECommerceService/latest/DG/
@@ -35,7 +25,22 @@ AMAZON_PREAMBLE = """GET
 webservices.amazon.com
 /onca/xml
 """
-locale.setlocale(locale.LC_ALL, 'en_US')
+
+_FORMAT = '%s.txt' if platform.system() == 'Windows' else '.%s'
+
+
+FLAGS = flags.FLAGS
+flags.DEFINE_string('amazon_id_file',
+                    os.path.join(os.path.expanduser('~'),
+                                 _FORMAT % ('amazon-id',)),
+                    'File containing amazon identity')
+flags.DEFINE_string('amazon_key_file',
+                    os.path.join(os.path.expanduser('~'),
+                                 _FORMAT % ('amazon-key',)),
+                    'File containing amazon secret key')
+
+locale.setlocale(locale.LC_ALL, '')
+
 
 def _FileToString(filename):
     """Given a file, return a string containing the contents."""
