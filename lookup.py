@@ -66,9 +66,9 @@ def _PrintBestPrice(best_price):
         print 'Best Price: %s' % (best_price,)
 
 
-def _PrintNotes(notes):
-    if notes:
-        print 'Title: %s' % (notes,)
+def _PrintTitle(title):
+    if title:
+        print 'Title: %s' % (title,)
 
 
 def _DotProduct(xs, ys):
@@ -149,7 +149,7 @@ def _EncodeUrl(isbn, get_title=False):
 
 def _LookupIsbn(isbn):
     isbn, modified = _NormalizeIsbn(isbn)
-    lookup_url = _EncodeUrl(isbn, get_title=modified)
+    lookup_url = _EncodeUrl(isbn, get_title=True)
     try:
         response = urllib2.urlopen(lookup_url)
     except urllib2.URLError, e:
@@ -185,14 +185,13 @@ def _LookupIsbn(isbn):
         best_price = '(None)'
 
     # title HACK
-    notes = ''
+    title = ''
     item_attributes = xml_response.partition('<ItemAttributes>')[2].partition(
             '</ItemAttributes>')[0]
     if '<Title>' in item_attributes:
         title = xml_response.partition('<Title>')[2].partition('</Title>')[0]
-        notes = title
 
-    return best_price, sales_rank, notes
+    return best_price, sales_rank, title
 
 class EncodeUrlCmd(appcommands.Cmd):
     """Given an ISBN, encode a URL that looks up that ISBN."""
@@ -218,7 +217,7 @@ class LookupIsbnCmd(appcommands.Cmd):
 
         isbn = str(argv[1])
         try:
-            best_price, sales_rank, notes = _LookupIsbn(isbn)
+            best_price, sales_rank, title = _LookupIsbn(isbn)
         except RuntimeError, e:
             print "Error looking up ISBN:",
             if '\n' in e:
@@ -228,59 +227,61 @@ class LookupIsbnCmd(appcommands.Cmd):
         print 'ISBN: %s' % (isbn,)
         _PrintBestPrice(best_price)
         _PrintSalesRank(sales_rank)
-        _PrintNotes(notes)
+        _PrintTitle(title)
 
 
 class LookupAllCmd(appcommands.Cmd):
     """Given a filename, look up all ISBNs in that file."""
     def __init__(self, argv, fv):
         super(LookupAllCmd, self).__init__(argv, fv)
-        flags.DEFINE_boolean('price_only', False,
-                             'Only print price information, not sales rank.')
+        flags.DEFINE_boolean('full_info', False,
+                             'Print all information to file, not just isbn and sales rank.')
+        flags.DEFINE_boolean('abbreviate', True,
+                             'Abbreviate titles to fit on one line.')
         flags.DEFINE_boolean('quiet', False,
                              'Only output to file.')
-        flags.DEFINE_string('output_filename', None,
-                            'Filename to output results of ISBN lookups.')
         
     def Run(self, argv):
-        if len(argv) != 2:
+        if len(argv) not in [2, 3]:
             app.usage(shorthelp=1,
                       detailed_error='Incorrect number of arguments, ' +
-                      'expected 1, got %s' % (len(argv) - 1,),
+                      'expected 1 or 2, got %s' % (len(argv) - 1,),
                       exitcode=1)
-        if FLAGS.quiet and FLAGS.output_filename is None:
-            app.usage(shorthelp=1,
-                      detailed_error='Quiet and no output file -- nothing to do!',
-                      exitcode=1)
+            
+        output_filename = argv[2] if len(argv) == 3 else None
+        if FLAGS.quiet and output_filename is None:
+            print 'Quiet and no output file -- nothing to do!'
+            return
+            
         input_file = argv[1]
         if not os.path.exists(input_file):
             print 'Cannot find file: %s' % (input_file,)
             exit(1)
-        if FLAGS.output_filename:
-            f = open(FLAGS.output_filename, 'w')
+        if output_filename is not None:
+            f = open(output_filename, 'w')
 
         if not FLAGS.quiet:
-            format = '%13s %10s %12s  %s'
-            print '    ISBN         Price    Sales Rank     Notes'
-            print '------------- ---------- ------------ -----------'
+            format = '%13s %9s  %11s   %s'
+            print '    ISBN         Price    Sales Rank              Title'
+            print '------------- ---------- ------------',
+            print '-----------------------------------------------'
             
-        isbn_ls = [x.rstrip() for x in open(input_file, 'r').readlines()]
+        isbn_ls = [_OnlyDigitsX(x.rstrip()) for x in open(input_file, 'r').readlines()]
         for isbn in isbn_ls:
-            isbn = _OnlyDigitsX(isbn)
             try:
-                best_price, sales_rank, notes = _LookupIsbn(isbn)
+                best_price, sales_rank, title = _LookupIsbn(isbn)
             except RuntimeError, e:
                 best_price = ''
                 sales_rank = ''
-                notes = ''
+                title = ''
             
             # output to file
-            if FLAGS.output_filename:
-                if FLAGS.price_only:
-                    print >>f, '%s %s'%(_NormalizeIsbn(isbn)[0], best_price)
-                else:
+            if output_filename:
+                if FLAGS.full_info:
                     print >>f, '%s %s %s %s'%(isbn, best_price, sales_rank,
-                                              notes)
+                                              title)
+                else:
+                    print >>f, '%s %s'%(_NormalizeIsbn(isbn)[0], best_price)
                     
             # print to terminal
             if not FLAGS.quiet:
@@ -293,10 +294,10 @@ class LookupAllCmd(appcommands.Cmd):
                                          grouping=True)
                 except ValueError:
                     rank = '(None)'
-                if len(notes) > 40:
-                    notes = notes[:37] + '...'
-                print format % (isbn, price, rank, notes)
-        if FLAGS.output_filename:
+                if FLAGS.abbreviate and len(title) > 45:
+                    title = title[:42] + '...'
+                print format % (isbn, price, rank, title)
+        if output_filename is not None:
             f.close()
             
 
