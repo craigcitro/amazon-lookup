@@ -339,7 +339,7 @@ class VerifyCmd(appcommands.Cmd):
         print 'Trying ISBN lookup ...',
         sys.stdout.flush()
         try:
-            _LookupIsbn(1573980137)
+            _LookupIsbn('1573980137')
         except RuntimeError, e:
             print 'FAIL'
             print 'Error trying to lookup a valid ISBN:',
