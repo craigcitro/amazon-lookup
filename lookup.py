@@ -102,6 +102,57 @@ class MaybePrice(object):
     else:
       return cmp(self.price, other.price)
 
+
+class Isbn(object):
+  def __init__(self, raw_isbn):
+    self.isbn = Isbn.Normalize(raw_isbn)
+
+  def __str__(self):
+    return '%s' % (self.isbn,)
+
+  def __repr__(self):
+    return 'ISBN: %s' % (self,)
+
+  def __cmp__(self, other):
+    if not isinstance(other, Isbn):
+      raise ValueError('cannot compare Isbn to %s' % (type(other).__name__,))
+    return cmp(self.isbn, other.isbn)
+
+  @staticmethod
+  def _CalculateCheckDigit(digits):
+   if len(digits) == 9:
+     sum = _DotProduct(digits, range(1,10)) % 11
+     if sum != 10:
+       return str(sum)
+     else:
+       return 'X'
+   elif len(digits) == 12:
+     sum = 10 - _DotProduct(digits, [1, 3] * 6) % 10
+     return str(10 - sum)
+   else:
+     raise ValueError('invalid ISBN length: %s' % len(digits))
+  
+  @staticmethod
+  def Normalize(raw_isbn):
+    isbn = ''.join(x for x in raw_isbn if x.isdigit())
+    if not isbn:
+      raise ValueError('Invalid ISBN: %s' % (raw_isbn,))
+    if raw_isbn.rstrip()[-1].upper() == 'X':
+      isbn += 'X'
+
+    # Having calculated the provided ISBN, we now deal with corner
+    # cases and remove the last digit (which we simply recalculate).
+    if len(isbn) == 9:  # old British ISBNs
+      root = '0' + isbn[:-1]
+    elif len(isbn) == 10:
+      root = isbn[:-1]
+    elif len(isbn) == 13:
+      root = isbn[3:-1]
+    else:
+      raise ValueError('Invalid ISBN (wrong length): %s' % (raw_isbn,))
+
+    checksum = Isbn._CalculateCheckDigit(root)
+    return root + checksum
     
 def _PrintTitle(title):
   if title:
@@ -110,30 +161,6 @@ def _PrintTitle(title):
 
 def _DotProduct(xs, ys):
   return sum(int(x)*int(y) for x, y in zip(xs, ys))
-
-
-def _OnlyDigitsX(s):
-  result = ''
-  for x in s:
-    if x.isdigit():
-      result += x
-  if (s and s[-1].upper() == 'X'):
-    result += s[-1]
-  return result
-
-
-def _IsbnCheckDigit(digits):
-  if len(digits) == 9:
-    sum = _DotProduct(digits, range(1,10)) % 11
-    if sum != 10:
-      return str(sum)
-    else:
-      return 'X'
-  elif len(digits) == 12:
-    sum = 10 - _DotProduct(digits, [1, 3] * 6) % 10
-    return str(10 - sum)
-  else:
-    raise ValueError('invalid ISBN length: %s' % len(digits))
 
 
 def _GetSalesInfo(xml_response):
@@ -172,33 +199,9 @@ def _GetSalesInfo(xml_response):
     item_info['isbn'] = _FindChild(item, 'ASIN')
     results[item_info['isbn']] = item_info
 
-  #pprint.pprint(results)
-    
   return results
 
   
-def _CompareIsbns(x, y):
-  return x.lower() == y.lower()
-
-
-def _NormalizeIsbn(isbn):
-  # Get rid of extra characters
-  isbn = _OnlyDigitsX(isbn)
-  # Handle old British ISBNs:
-  if len(isbn) == 9:
-    root = '0' + isbn[-1]
-  elif len(isbn) == 10:
-    root = isbn[:-1]
-  # Move ISBN13 to ISBN10
-  elif len(isbn) == 13:
-    root = isbn[3:-1]
-  else:
-    raise RuntimeError('Invalid ISBN (wrong length): %s' % (isbn,))
-
-  checksum = _IsbnCheckDigit(root)
-  return (root + checksum, not _CompareIsbns(root + checksum, isbn))
-
-
 def _EncodeUrl(isbn, get_title=False):
   response_groups = 'SalesRank,OfferSummary'
   if get_title:
@@ -206,7 +209,7 @@ def _EncodeUrl(isbn, get_title=False):
   parameters = {
     'AssociateTag': _FileToString(FLAGS.amazon_associate_id_file),
     'AWSAccessKeyId': _FileToString(FLAGS.amazon_id_file),
-    'ItemId': isbn,
+    'ItemId': str(isbn),
     'Operation': 'ItemLookup',
     'ResponseGroup': response_groups,
     'Service': 'AWSECommerceService',
@@ -227,7 +230,6 @@ def _EncodeUrl(isbn, get_title=False):
 
 
 def _LookupIsbn(isbn):
-  isbn, _ = _NormalizeIsbn(isbn)
   lookup_url = _EncodeUrl(isbn, get_title=True)
   try:
     response = urllib2.urlopen(lookup_url)
@@ -249,7 +251,7 @@ class EncodeUrlCmd(appcommands.Cmd):
         'expected 1, got %s' % (len(argv) - 1,),
         exitcode=1)
 
-    isbn = str(argv[1])
+    isbn = Isbn(argv[1])
     print _EncodeUrl(isbn)
 
 
@@ -262,10 +264,10 @@ class LookupIsbnCmd(appcommands.Cmd):
         'expected 1, got %s' % (len(argv) - 1,),
         exitcode=1)
 
-    isbn, _ = _NormalizeIsbn(str(argv[1]))
+    isbn = Isbn(argv[1])
     try:
       response = _LookupIsbn(isbn)
-      item_info = _GetSalesInfo(response)[isbn]
+      item_info = _GetSalesInfo(response)[str(isbn)]
     except RuntimeError, e:
       print "Error looking up ISBN:",
       if '\n' in e:
@@ -314,10 +316,9 @@ class LookupAllCmd(appcommands.Cmd):
       print '------------- ---------- ------------',
       print '-----------------------------------------------'
 
-    isbn_ls = [_OnlyDigitsX(x.rstrip()) for x in open(input_file, 'r').readlines()]
-    for orig_isbn in isbn_ls:
-      isbn, _ = _NormalizeIsbn(orig_isbn)
+    for raw_isbn in open(input_file):
       try:
+        isbn = Isbn(raw_isbn)
         response = _LookupIsbn(isbn)
         item_info = _GetSalesInfo(response)[isbn]
         best_price = item_info['best_price']
@@ -334,7 +335,7 @@ class LookupAllCmd(appcommands.Cmd):
           print >>f, '%s %s %s %s'%(isbn, best_price, sales_rank,
             title)
         else:
-          print >>f, '%s %s'%(_NormalizeIsbn(isbn)[0], best_price)
+          print >>f, '%s %s'%(isbn, best_price)
 
       # print to terminal
       if not FLAGS.quiet:
@@ -358,13 +359,8 @@ class ValidateIsbnCmd(appcommands.Cmd):
         detailed_error='Incorrect number of arguments, ' +
         'expected 1, got %s' % (len(argv) - 1,),
         exitcode=1)
-    isbn = _OnlyDigitsX(argv[1])
-    print 'ISBN: %s' % (isbn,)
-    checksum = _IsbnCheckDigit(isbn[:-1])
-    if (checksum != isbn[-1]):
-      print 'Corrected ISBN: %s' % (isbn[:-1] + checksum)
-    if len(isbn) != 10:
-      print 'ISBN10: %s' % (_NormalizeIsbn(isbn)[0])
+    isbn = Isbn(argv[1])
+    print isbn
 
 
 class VerifyCmd(appcommands.Cmd):
