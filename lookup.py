@@ -4,15 +4,22 @@
 # 
 
 import base64
+import csv
 import hashlib
 import hmac
 import locale
 import os
 import platform
+import pprint
+import re
 import sys
 import time
 import urllib
 import urllib2
+import xml
+import xml.dom.minidom as minidom
+import xml.etree.ElementTree as ElementTree
+
 
 import gflags as flags
 import google.apputils.app as app
@@ -30,6 +37,10 @@ _FORMAT = '%s.txt' if platform.system() == 'Windows' else '.%s'
 
 
 FLAGS = flags.FLAGS
+flags.DEFINE_string(
+  'amazon_associate_id_file',
+  os.path.join(os.path.expanduser('~'), _FORMAT % ('amazon-associate-id',)),
+  'File containing amazon associate ID')
 flags.DEFINE_string(
   'amazon_id_file',
   os.path.join(os.path.expanduser('~'), _FORMAT % ('amazon-id',)),
@@ -58,14 +69,40 @@ def _PrintSalesRank(sales_rank):
     print 'Sales Rank: %s' % (sales_rank,)
 
 
-def _PrintBestPrice(best_price):
-  try:
-    price = float(best_price)
-    print 'Best Price: $%s' % (best_price,)
-  except ValueError:
-    print 'Best Price: %s' % (best_price,)
+class MaybePrice(object):
+  def __init__(self, value=None):
+    self.price = None
+    if isinstance(value, int):
+      self.price = value
+    elif isinstance(value, float):
+      self.price = int(100 * value)
+    elif isinstance(value, basestring):
+      self.price = int(float(value))
 
+  @property
+  def defined(self):
+    return self.price is not None
+      
+  def __str__(self):
+    if self.defined:
+      return '$%.2f' % (self.price / 100.0,)
+    else:
+      return '(None)'
 
+  def __repr__(self):
+    return str(self)
+
+  def __cmp__(self, other):
+    if not isinstance(other, MaybePrice):
+      raise ValueError('cannot compare MaybePrice to %s' % (type(other).__name__,))
+    elif not self.defined:
+      return 1
+    elif not other.defined:
+      return -1
+    else:
+      return cmp(self.price, other.price)
+
+    
 def _PrintTitle(title):
   if title:
     print 'Title: %s' % (title,)
@@ -99,6 +136,47 @@ def _IsbnCheckDigit(digits):
     raise ValueError('invalid ISBN length: %s' % len(digits))
 
 
+def _GetSalesInfo(xml_response):
+  def _FindChildren(xml, tag):
+    namespace = re.finditer('{(.*)}.*', xml.tag).next().groups()[0]
+    resolved_tags = ['{%s}%s' % (namespace, tag) for tag in tag.split('/')]
+    result = xml.findall('.//' + '/'.join(resolved_tags))
+    return result
+    
+  def _FindChild(xml, tag, default=None):
+    results = _FindChildren(xml, tag)
+    if results:
+      return results[0].text
+    else:
+      return default
+  
+  xml = ElementTree.XML(xml_response)
+  # Check for a failed request
+  errors = _FindChildren(xml, 'Errors')
+  if errors:
+    raise ValueError(_FindChild(errors[0], 'Message', '(Unknown error)'))
+
+  results = {}
+  for item in _FindChildren(xml, 'Item'):
+    item_info = {}
+    item_info['sales_rank'] = _FindChild(
+      item, 'SalesRank', default='(None)')
+    offer_summary = _FindChildren(item, 'OfferSummary')[0]
+    item_info['best_used_price'] = MaybePrice(
+      _FindChild(offer_summary, 'LowestUsedPrice/Amount', None))
+    item_info['best_new_price'] = MaybePrice(
+      _FindChild(offer_summary, 'LowestNewPrice/Amount', None))
+    item_info['best_price'] = min(item_info['best_new_price'],
+                                  item_info['best_used_price'])
+    item_info['title'] = _FindChild(item, 'Title')
+    item_info['isbn'] = _FindChild(item, 'ASIN')
+    results[item_info['isbn']] = item_info
+
+  #pprint.pprint(results)
+    
+  return results
+
+  
 def _CompareIsbns(x, y):
   return x.lower() == y.lower()
 
@@ -126,6 +204,7 @@ def _EncodeUrl(isbn, get_title=False):
   if get_title:
     response_groups += ',ItemAttributes'
   parameters = {
+    'AssociateTag': _FileToString(FLAGS.amazon_associate_id_file),
     'AWSAccessKeyId': _FileToString(FLAGS.amazon_id_file),
     'ItemId': isbn,
     'Operation': 'ItemLookup',
@@ -148,7 +227,7 @@ def _EncodeUrl(isbn, get_title=False):
 
 
 def _LookupIsbn(isbn):
-  isbn, modified = _NormalizeIsbn(isbn)
+  isbn, _ = _NormalizeIsbn(isbn)
   lookup_url = _EncodeUrl(isbn, get_title=True)
   try:
     response = urllib2.urlopen(lookup_url)
@@ -158,40 +237,8 @@ def _LookupIsbn(isbn):
   if response.getcode() != 200:
     raise RuntimeError('Error looking up ISBN. Error code: ' +
       `response.getcode()`)
-  xml_response = response.readline()
-  # What I should really do is create a parser, parse the response,
-  # do something with relevant data, maybe do verification/sanity
-  # checks, etc. Instead, just grab the things I know are there.
+  return response.readline()
 
-  # fail HACK
-  if 'is not a valid value for ItemId' in xml_response:
-    raise ValueError('invalid ISBN: %s' % isbn)
-
-  # sales rank HACK
-  sales_rank = '(None)'
-  if '<SalesRank>' in xml_response:
-    sales_rank = xml_response.partition('<SalesRank>')[2].partition(
-      '</SalesRank>')[0]
-
-  # lowest price HACK
-  if '<Amount>' in xml_response:
-    prices = []
-    offer_summary = xml_response.partition('<OfferSummary>')[2].partition(
-      '</OfferSummary>')[0]
-    for s in offer_summary.split('<Amount>')[1:]:
-      prices.append(s[:s.find('<')])
-    best_price = '%.2f' % (min([int(p) for p in prices])/100.0,)
-  else:
-    best_price = '(None)'
-
-  # title HACK
-  title = ''
-  item_attributes = xml_response.partition('<ItemAttributes>')[2].partition(
-    '</ItemAttributes>')[0]
-  if '<Title>' in item_attributes:
-    title = xml_response.partition('<Title>')[2].partition('</Title>')[0]
-
-  return best_price, sales_rank, title
 
 class EncodeUrlCmd(appcommands.Cmd):
   """Given an ISBN, encode a URL that looks up that ISBN."""
@@ -215,19 +262,20 @@ class LookupIsbnCmd(appcommands.Cmd):
         'expected 1, got %s' % (len(argv) - 1,),
         exitcode=1)
 
-    isbn = str(argv[1])
+    isbn, _ = _NormalizeIsbn(str(argv[1]))
     try:
-      best_price, sales_rank, title = _LookupIsbn(isbn)
+      response = _LookupIsbn(isbn)
+      item_info = _GetSalesInfo(response)[isbn]
     except RuntimeError, e:
       print "Error looking up ISBN:",
       if '\n' in e:
         print
       print e
       exit(1)
-    print 'ISBN: %s' % (isbn,)
-    _PrintBestPrice(best_price)
-    _PrintSalesRank(sales_rank)
-    _PrintTitle(title)
+    print 'ISBN: %s' % (item_info['isbn'],)
+    print 'Best Price: %s' % (item_info['best_price'],)
+    _PrintSalesRank(item_info['sales_rank'])
+    _PrintTitle(item_info['title'])
 
 
 class LookupAllCmd(appcommands.Cmd):
@@ -259,7 +307,7 @@ class LookupAllCmd(appcommands.Cmd):
       exit(1)
     if output_filename is not None:
       f = open(output_filename, 'w')
-
+    
     if not FLAGS.quiet:
       format = '%13s %9s  %11s   %s'
       print '    ISBN         Price    Sales Rank              Title'
@@ -267,11 +315,16 @@ class LookupAllCmd(appcommands.Cmd):
       print '-----------------------------------------------'
 
     isbn_ls = [_OnlyDigitsX(x.rstrip()) for x in open(input_file, 'r').readlines()]
-    for isbn in isbn_ls:
+    for orig_isbn in isbn_ls:
+      isbn, _ = _NormalizeIsbn(orig_isbn)
       try:
-        best_price, sales_rank, title = _LookupIsbn(isbn)
+        response = _LookupIsbn(isbn)
+        item_info = _GetSalesInfo(response)[isbn]
+        best_price = item_info['best_price']
+        sales_rank = item_info['sales_rank']
+        title = item_info['title']
       except RuntimeError, e:
-        best_price = ''
+        best_price = MaybePrice()
         sales_rank = ''
         title = ''
 
@@ -286,17 +339,13 @@ class LookupAllCmd(appcommands.Cmd):
       # print to terminal
       if not FLAGS.quiet:
         try:
-          price = '$%.2f' % (float(best_price),)
-        except ValueError:
-          price = '(None)'
-        try:
           rank = locale.format('%d', int(sales_rank),
             grouping=True)
         except ValueError:
           rank = '(None)'
         if FLAGS.abbreviate and len(title) > 45:
           title = title[:42] + '...'
-        print format % (isbn, price, rank, title)
+        print format % (isbn, best_price, rank, title)
     if output_filename is not None:
       f.close()
 
