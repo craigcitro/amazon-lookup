@@ -17,7 +17,6 @@ import time
 import urllib
 import urllib2
 import xml
-import xml.dom.minidom as minidom
 import xml.etree.ElementTree as ElementTree
 
 
@@ -27,16 +26,11 @@ import google.apputils.appcommands as appcommands
 
 # URL encoding process is described here:
 #   http://docs.amazonwebservices.com/AWSECommerceService/latest/DG/
-AMAZON_ROOT_URL = 'http://webservices.amazon.com/onca/xml'
-AMAZON_PREAMBLE = """GET
-webservices.amazon.com
-/onca/xml
-"""
-
 _FORMAT = '%s.txt' if platform.system() == 'Windows' else '.%s'
-
-
+locale.setlocale(locale.LC_ALL, '')
 FLAGS = flags.FLAGS
+
+
 flags.DEFINE_string(
   'amazon_associate_id_file',
   os.path.join(os.path.expanduser('~'), _FORMAT % ('amazon-associate-id',)),
@@ -50,23 +44,41 @@ flags.DEFINE_string(
   os.path.join(os.path.expanduser('~'), _FORMAT % ('amazon-key',)),
   'File containing amazon secret key')
 
-locale.setlocale(locale.LC_ALL, '')
+_CLIENT = None
+def Client():
+  global _CLIENT
+  if _CLIENT is None:
+    _CLIENT = AmazonClient()
+  return _CLIENT
 
 
-def _FileToString(filename):
-  """Given a file, return a string containing the contents."""
-  if not os.path.exists(filename):
-    return ''
-  lines = open(filename, 'r').readlines()
-  return ''.join([x.strip() for x in lines])
+def _PrintXml(xml):
+  import xml.dom.minidom as minidom
+  print minidom.parseString(xml).toprettyxml()
 
 
-def _PrintSalesRank(sales_rank):
-  try:
-    rank = int(sales_rank)
-    print 'Sales Rank: ' + locale.format('%d', rank, grouping=True)
-  except ValueError:
-    print 'Sales Rank: %s' % (sales_rank,)
+class MaybeSalesRank(object):
+  def __init__(self, rank=None):
+    if rank is not None:
+      self.rank = int(rank)
+    else:
+      self.rank = None
+
+  @property
+  def defined(self):
+    return self.rank is not None
+
+  def __str__(self):
+    if self.defined:
+      return str(self.rank)
+    else:
+      return '(None)'
+  
+  def __repr__(self):
+    if self.defined:
+      return locale.format('%d', self.rank, grouping=True)
+    else:
+      return '(None)'
 
 
 class MaybePrice(object):
@@ -120,18 +132,21 @@ class Isbn(object):
 
   @staticmethod
   def _CalculateCheckDigit(digits):
-   if len(digits) == 9:
-     sum = _DotProduct(digits, range(1,10)) % 11
-     if sum != 10:
-       return str(sum)
-     else:
-       return 'X'
-   elif len(digits) == 12:
-     sum = 10 - _DotProduct(digits, [1, 3] * 6) % 10
-     return str(10 - sum)
-   else:
-     raise ValueError('invalid ISBN length: %s' % len(digits))
-  
+    def _DotProduct(xs, ys):
+      return sum(int(x)*int(y) for x, y in zip(xs, ys))
+
+    if len(digits) == 9:
+      digit_sum = _DotProduct(digits, range(1,10)) % 11
+      if digit_sum != 10:
+        return str(digit_sum)
+      else:
+        return 'X'
+    elif len(digits) == 12:
+      digit_sum = 10 - _DotProduct(digits, [1, 3] * 6) % 10
+      return str(10 - digit_sum)
+    else:
+      raise ValueError('invalid ISBN length: %s' % len(digits))
+
   @staticmethod
   def Normalize(raw_isbn):
     isbn = ''.join(x for x in raw_isbn if x.isdigit())
@@ -154,92 +169,95 @@ class Isbn(object):
     checksum = Isbn._CalculateCheckDigit(root)
     return root + checksum
     
-def _PrintTitle(title):
-  if title:
-    print 'Title: %s' % (title,)
+class AmazonClient(object):
+  AMAZON_ROOT_URL = 'http://webservices.amazon.com/onca/xml'
+  AMAZON_PREAMBLE = """GET\nwebservices.amazon.com\n/onca/xml\n"""
 
+  def __init__(self, **kwds):
+    ReadFile = lambda f: open(f).read().strip()
+    self.amazon_id = ReadFile(FLAGS.amazon_id_file)
+    self.amazon_key = ReadFile(FLAGS.amazon_key_file)
+    self.amazon_associate_id = ReadFile(FLAGS.amazon_associate_id_file)
 
-def _DotProduct(xs, ys):
-  return sum(int(x)*int(y) for x, y in zip(xs, ys))
+  def EncodeUrl(self, isbns):
+    response_groups = 'SalesRank,Offers,ItemAttributes'
+    parameters = {
+      'AssociateTag': self.amazon_associate_id,
+      'AWSAccessKeyId': self.amazon_id,
+      'ItemId': ','.join(str(isbn) for isbn in isbns),
+      'Operation': 'ItemLookup',
+      'ResponseGroup': response_groups,
+      'Service': 'AWSECommerceService',
+      'Timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+      'Version': '2010-09-01',
+      }
+    query_string = '&'.join(sorted(urllib.urlencode(parameters).split('&')))
+    string_to_sign = AmazonClient.AMAZON_PREAMBLE + query_string
 
+    encoding_key = self.amazon_key
+    encoder = hmac.new(encoding_key, digestmod=hashlib.sha256)
+    encoder.update(string_to_sign)
+    signature = base64.b64encode(encoder.digest())
+    parameters['Signature'] = signature
 
-def _GetSalesInfo(xml_response):
-  def _FindChildren(xml, tag):
-    namespace = re.finditer('{(.*)}.*', xml.tag).next().groups()[0]
-    resolved_tags = ['{%s}%s' % (namespace, tag) for tag in tag.split('/')]
-    result = xml.findall('.//' + '/'.join(resolved_tags))
-    return result
-    
-  def _FindChild(xml, tag, default=None):
-    results = _FindChildren(xml, tag)
-    if results:
-      return results[0].text
-    else:
-      return default
-  
-  xml = ElementTree.XML(xml_response)
-  # Check for a failed request
-  errors = _FindChildren(xml, 'Errors')
-  if errors:
-    raise ValueError(_FindChild(errors[0], 'Message', '(Unknown error)'))
+    final_url = AmazonClient.AMAZON_ROOT_URL + '?' + urllib.urlencode(parameters)
+    return final_url
 
-  results = {}
-  for item in _FindChildren(xml, 'Item'):
-    item_info = {}
-    item_info['sales_rank'] = _FindChild(
-      item, 'SalesRank', default='(None)')
-    offer_summary = _FindChildren(item, 'OfferSummary')[0]
-    item_info['best_used_price'] = MaybePrice(
-      _FindChild(offer_summary, 'LowestUsedPrice/Amount', None))
-    item_info['best_new_price'] = MaybePrice(
-      _FindChild(offer_summary, 'LowestNewPrice/Amount', None))
-    item_info['best_price'] = min(item_info['best_new_price'],
-                                  item_info['best_used_price'])
-    item_info['title'] = _FindChild(item, 'Title')
-    item_info['isbn'] = _FindChild(item, 'ASIN')
-    results[item_info['isbn']] = item_info
+  def LookupIsbns(self, isbns):
+    if len(isbns) > 10:
+      raise RuntimeError('Cannot look up more than 10 ISBNs per request.')
+    lookup_url = self.EncodeUrl(isbns)
+    try:
+      response = urllib2.urlopen(lookup_url)
+    except urllib2.URLError, e:
+      raise RuntimeError('Error looking up ISBN.\nURL: %s\nResponse: %s\n' %
+        (lookup_url, str(e)))
+    if response.getcode() != 200:
+      raise RuntimeError('Error looking up ISBN. Error code: ' +
+        `response.getcode()`)
+    return response.readline()
 
-  return results
+  @staticmethod
+  def GetSalesInfo(xml_response):
+    def _FindChildren(xml, tag):
+      namespace = re.finditer('{(.*)}.*', xml.tag).next().groups()[0]
+      resolved_tags = ['{%s}%s' % (namespace, tag) for tag in tag.split('/')]
+      result = xml.findall('.//' + '/'.join(resolved_tags))
+      return result
 
-  
-def _EncodeUrl(isbn, get_title=False):
-  response_groups = 'SalesRank,OfferSummary'
-  if get_title:
-    response_groups += ',ItemAttributes'
-  parameters = {
-    'AssociateTag': _FileToString(FLAGS.amazon_associate_id_file),
-    'AWSAccessKeyId': _FileToString(FLAGS.amazon_id_file),
-    'ItemId': str(isbn),
-    'Operation': 'ItemLookup',
-    'ResponseGroup': response_groups,
-    'Service': 'AWSECommerceService',
-    'Timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-    'Version': '2010-09-01',
-    }
-  query_string = '&'.join(sorted(urllib.urlencode(parameters).split('&')))
-  string_to_sign = AMAZON_PREAMBLE + query_string
+    def _FindChild(xml, tag, default=None):
+      results = _FindChildren(xml, tag)
+      if results:
+        return results[0].text
+      else:
+        return default
 
-  encoding_key = _FileToString(FLAGS.amazon_key_file)
-  encoder = hmac.new(encoding_key, digestmod=hashlib.sha256)
-  encoder.update(string_to_sign)
-  signature = base64.b64encode(encoder.digest())
-  parameters['Signature'] = signature
+    xml = ElementTree.XML(xml_response)
+    # Check for a failed request
+    errors = _FindChildren(xml, 'Errors')
+    if errors:
+      raise ValueError(_FindChild(errors[0], 'Message', '(Unknown error)'))
 
-  final_url = AMAZON_ROOT_URL + '?' + urllib.urlencode(parameters)
-  return final_url
+    results = {}
+    for item in _FindChildren(xml, 'Item'):
+      item_info = {}
+      item_info['sales_rank'] = MaybeSalesRank(
+        _FindChild(item, 'SalesRank', default='(None)'))
+      offer_summary = _FindChildren(item, 'OfferSummary')[0]
+      item_info['best_used_price'] = MaybePrice(
+        _FindChild(offer_summary, 'LowestUsedPrice/Amount'))
+      item_info['best_new_price'] = MaybePrice(
+        _FindChild(offer_summary, 'LowestNewPrice/Amount'))
+      item_info['best_price'] = min(item_info['best_new_price'],
+        item_info['best_used_price'])
+      item_info['amazon_price'] = MaybePrice(
+        _FindChild(item, 'OfferListing/Price/Amount'))
+      item_info['title'] = _FindChild(item, 'Title')
+      item_info['isbn'] = _FindChild(item, 'ASIN')
+      item_info['timestamp'] = (int(time.time()) // 1000) * 1000
+      results[item_info['isbn']] = item_info
 
-
-def _LookupIsbn(isbn):
-  lookup_url = _EncodeUrl(isbn, get_title=True)
-  try:
-    response = urllib2.urlopen(lookup_url)
-  except urllib2.URLError, e:
-    raise RuntimeError('Error looking up ISBN.\nURL: %s\nResponse: %s\n' %
-      (lookup_url, str(e)))
-  if response.getcode() != 200:
-    raise RuntimeError('Error looking up ISBN. Error code: ' +
-      `response.getcode()`)
-  return response.readline()
+    return results
 
 
 class EncodeUrlCmd(appcommands.Cmd):
@@ -252,7 +270,7 @@ class EncodeUrlCmd(appcommands.Cmd):
         exitcode=1)
 
     isbn = Isbn(argv[1])
-    print _EncodeUrl(isbn)
+    print Client().EncodeUrl([isbn])
 
 
 class LookupIsbnCmd(appcommands.Cmd):
@@ -266,8 +284,8 @@ class LookupIsbnCmd(appcommands.Cmd):
 
     isbn = Isbn(argv[1])
     try:
-      response = _LookupIsbn(isbn)
-      item_info = _GetSalesInfo(response)[str(isbn)]
+      response = Client().LookupIsbns([isbn])
+      item_info = AmazonClient.GetSalesInfo(response)[str(isbn)]
     except RuntimeError, e:
       print "Error looking up ISBN:",
       if '\n' in e:
@@ -276,8 +294,9 @@ class LookupIsbnCmd(appcommands.Cmd):
       exit(1)
     print 'ISBN: %s' % (item_info['isbn'],)
     print 'Best Price: %s' % (item_info['best_price'],)
-    _PrintSalesRank(item_info['sales_rank'])
-    _PrintTitle(item_info['title'])
+    print 'Amazon Price: %s' % (item_info['amazon_price'],)
+    print 'Sales Rank: %r' % (item_info['sales_rank'],)
+    print 'Title: %s' % (item_info['title'],)
 
 
 class LookupAllCmd(appcommands.Cmd):
@@ -290,7 +309,53 @@ class LookupAllCmd(appcommands.Cmd):
       'Abbreviate titles to fit on one line.')
     flags.DEFINE_boolean('quiet', False,
       'Only output to file.')
+    self.outfile = None
+    self.csv_writer = None
 
+  def __del__(self):
+    if self.outfile is not None:
+      self.outfile.close()
+
+  def PrintItem(self, isbn, item_info=None):
+    if item_info is None:
+      best_price = MaybePrice()
+      sales_rank = MaybeSalesRank()
+      title = ''
+    else:
+      best_price = item_info['best_price']
+      sales_rank = item_info['sales_rank']
+      title = item_info['title']
+
+    # output to file
+    if self.outfile is not None:
+      if FLAGS.full_info:
+        print >>self.outfile, '%s %s %s %s' % (
+          isbn, best_price, sales_rank, title)
+      else:
+        print >>self.outfile, '%s %s' % (
+          isbn, best_price)
+
+    # print to terminal
+    if not FLAGS.quiet:
+      fmt = '%13s %9s  %11r   %s'
+      if FLAGS.abbreviate and len(title) > 45:
+        title = title[:42] + '...'
+      print fmt % (isbn, best_price, sales_rank, title)
+
+
+  def WriteCsv(self, results, write_header=False):
+    if self.csv_writer is None:
+      self.csv_writer = csv.DictWriter(
+        self.outfile, 
+        ['timestamp', 'isbn', 'amazon_price', 'best_new_price',
+         'best_used_price', 'sales_rank', 'title'],
+        extrasaction='ignore',
+        lineterminator='\n',
+        quoting=csv.QUOTE_MINIMAL)
+      if write_header:
+        self.csv_writer.writeheader()
+    self.csv_writer.writerows(results.itervalues())
+    
   def Run(self, argv):
     if len(argv) not in [2, 3]:
       app.usage(shorthelp=1,
@@ -298,57 +363,36 @@ class LookupAllCmd(appcommands.Cmd):
         'expected 1 or 2, got %s' % (len(argv) - 1,),
         exitcode=1)
 
-    output_filename = argv[2] if len(argv) == 3 else None
-    if FLAGS.quiet and output_filename is None:
-      print 'Quiet and no output file -- nothing to do!'
-      return
+    if len(argv) == 3:
+      if FLAGS.quiet and output_filename is None:
+        print 'Quiet and no output file -- nothing to do!'
+        return
+      outfile_name = argv[2]
+      as_csv = outfile_name.endswith('.csv')
+      new_outfile = not os.path.exists(outfile_name)
+      self.outfile = open(outfile_name, 'a')
 
     input_file = argv[1]
     if not os.path.exists(input_file):
       print 'Cannot find file: %s' % (input_file,)
       exit(1)
-    if output_filename is not None:
-      f = open(output_filename, 'w')
     
-    if not FLAGS.quiet:
-      format = '%13s %9s  %11s   %s'
+    if not (FLAGS.quiet or as_csv):
       print '    ISBN         Price    Sales Rank              Title'
       print '------------- ---------- ------------',
       print '-----------------------------------------------'
 
-    for raw_isbn in open(input_file):
-      try:
-        isbn = Isbn(raw_isbn)
-        response = _LookupIsbn(isbn)
-        item_info = _GetSalesInfo(response)[isbn]
-        best_price = item_info['best_price']
-        sales_rank = item_info['sales_rank']
-        title = item_info['title']
-      except RuntimeError, e:
-        best_price = MaybePrice()
-        sales_rank = ''
-        title = ''
-
-      # output to file
-      if output_filename:
-        if FLAGS.full_info:
-          print >>f, '%s %s %s %s'%(isbn, best_price, sales_rank,
-            title)
-        else:
-          print >>f, '%s %s'%(isbn, best_price)
-
-      # print to terminal
-      if not FLAGS.quiet:
-        try:
-          rank = locale.format('%d', int(sales_rank),
-            grouping=True)
-        except ValueError:
-          rank = '(None)'
-        if FLAGS.abbreviate and len(title) > 45:
-          title = title[:42] + '...'
-        print format % (isbn, best_price, rank, title)
-    if output_filename is not None:
-      f.close()
+    isbn_ls = map(Isbn, open(input_file).readlines())
+    while isbn_ls:
+      batch = map(str, isbn_ls[:10])
+      isbn_ls = isbn_ls[len(batch):]
+      response = Client().LookupIsbns(batch)
+      sales_infos = AmazonClient.GetSalesInfo(response)
+      if as_csv:
+        self.WriteCsv(sales_infos, write_header=new_outfile)
+      else:
+        for isbn in batch:
+          self.PrintItem(isbn, sales_infos.get(isbn))
 
 
 class ValidateIsbnCmd(appcommands.Cmd):
@@ -384,7 +428,7 @@ class VerifyCmd(appcommands.Cmd):
     print 'Trying ISBN lookup ...',
     sys.stdout.flush()
     try:
-      _LookupIsbn('1573980137')
+      Client().LookupIsbns(['1573980137'])
     except RuntimeError, e:
       print 'FAIL'
       print 'Error trying to lookup a valid ISBN:',
@@ -395,7 +439,7 @@ class VerifyCmd(appcommands.Cmd):
     print 'DONE'
     print 'Verification complete! Everything seems in order.'
 
-
+    
 def main(argv):
   appcommands.AddCmd('batch', LookupAllCmd)
   appcommands.AddCmd('encode', EncodeUrlCmd)
