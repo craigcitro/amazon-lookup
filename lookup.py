@@ -303,7 +303,7 @@ class LookupAllCmd(appcommands.Cmd):
   """Given a filename, look up all ISBNs in that file."""
   def __init__(self, argv, fv):
     super(LookupAllCmd, self).__init__(argv, fv)
-    flags.DEFINE_boolean('full_info', False,
+    flags.DEFINE_boolean('full_info', True,
       'Print all information to file, not just isbn and sales rank.')
     flags.DEFINE_boolean('abbreviate', True,
       'Abbreviate titles to fit on one line.')
