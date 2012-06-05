@@ -11,7 +11,7 @@ import platform
 import sys
 
 GUI_SCRIPTS = []
-VERSION = '0.1.6'
+VERSION = '0.2.1'
 
 
 if platform.system() == 'Windows':
